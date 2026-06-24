@@ -1,0 +1,32 @@
+{
+  "widget": {
+    "name": "settings.name",
+    "description": "settings.description",
+    "short_description": "settings.short_description",
+    "cover": "images/cover.png",
+    "logo": "images/logo.png",
+    "interface_version": 2,
+    "locale": ["pt", "en"],
+    "installation": false,
+    "auth": false,
+    "subscription": false,
+    "version": "1.0",
+    "support": {
+      "email": "contato@imperialbones.com.br"
+    },
+    "locations": ["salesbot_designer"],
+    "salesbot_designer": {
+      "logo": "images/logo.png",
+      "ia_bones": {
+        "name": "settings.handler_name",
+        "settings": {
+          "webhook_url": {
+            "name": "settings.webhook_url",
+            "type": "text",
+            "manual": true
+          }
+        }
+      }
+    }
+  }
+}

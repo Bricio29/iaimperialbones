@@ -1,0 +1,31 @@
+{
+  "name": "iaimperialbones",
+  "version": "1.0.0",
+  "description": "IA Imperial Bonés Personalizados — Webhook Mode (ChatClean)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "webhook",
+    "chatclean",
+    "ia",
+    "bones",
+    "personalizados",
+    "openai"
+  ],
+  "author": "Imperial Bonés Personalizados",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1",
+    "express": "^4.22.1",
+    "form-data": "^4.0.5",
+    "openai": "^4.20.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}

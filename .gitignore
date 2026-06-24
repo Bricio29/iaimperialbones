@@ -1,0 +1,10 @@
+node_modules/
+.env
+database.json
+*.log
+.DS_Store
+temp_audio_*
+docs/
+fix_*.py
+find_*.py
+documento_clique_massa_webhook.html
