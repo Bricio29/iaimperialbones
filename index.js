@@ -1767,6 +1767,10 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
 });
 
+app.get('/webhook', (req, res) => {
+    res.status(200).json({ status: 'ok' });
+});
+
 // =============================================================
 //  INICIALIZAÇÃO
 // =============================================================
