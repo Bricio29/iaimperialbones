@@ -1,7 +1,7 @@
 {
   "name": "iaimperialbones",
   "version": "1.0.0",
-  "description": "IA Imperial Bonés Personalizados — Webhook Mode (ChatClean)",
+  "description": "IA Imperial Bonés Personalizados — ChatClean (Webhook + Push API)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

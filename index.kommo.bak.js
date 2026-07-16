@@ -14,24 +14,33 @@ app.use(express.json({ limit: '10mb' }));
 app.use('/assets', express.static(path.join(__dirname, 'assets')));
 
 // =============================================================
-//  CONFIGURAÇÃO — ChatClean (Webhook de entrada + Push API de saída)
+//  CONFIGURAÇÃO — Kommo CRM
 //  Configure as variáveis no arquivo .env:
 //
-//  CC_PUSH_URL     = URL autenticada gerada em Configurações → API/Webhook → Adicionar
-//                    (o token JWT já vem embutido como ?token=...; não precisa de header)
-//  BASE_URL        = URL pública deste servidor (sem barra final) — serve as imagens em /assets
-//  WEBHOOK_SECRET  = Token opcional para validar as requisições do webhook de entrada
-//  EQUIPE_NUMERO   = WhatsApp interno que recebe o resumo dos leads qualificados
-//  IA_ALLOWED_CONTACTS = Números permitidos na fase de teste (vazio = responde a todos)
-//  PORT            = Porta do servidor (padrão: 3000)
+//  KOMMO_SUBDOMAIN          = Subdomínio da conta (ex: imperialbones)
+//  KOMMO_TOKEN              = Token de Longa Duração (gerado em Configurações → Integrações)
+//  KOMMO_PIPELINE_ID        = ID do funil onde os leads serão criados
+//  KOMMO_STATUS_ID_NOVO     = ID da etapa inicial do funil
+//  KOMMO_RESPONSIBLE_USER_ID = ID do usuário responsável pelos leads
+//  BASE_URL                 = URL pública deste servidor (para servir imagens)
+//  WEBHOOK_SECRET           = Token opcional para validar requisições do webhook
+//  PORT                     = Porta do servidor (padrão: 3000)
 // =============================================================
-const CC_PUSH_URL   = process.env.CC_PUSH_URL   || '';
-const BASE_URL      = process.env.BASE_URL      || '';
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
-const EQUIPE_NUMERO = process.env.EQUIPE_NUMERO || '';
-// Lista de números permitidos (fase de teste). Vazio = responde a todos.
-const IA_ALLOWED_CONTACTS = (process.env.IA_ALLOWED_CONTACTS || '').split(',').map(s => s.trim()).filter(Boolean);
-const PORT          = process.env.PORT          || 3000;
+const KOMMO_SUBDOMAIN           = process.env.KOMMO_SUBDOMAIN           || '';
+const KOMMO_TOKEN               = process.env.KOMMO_TOKEN               || '';
+const KOMMO_PIPELINE_ID         = process.env.KOMMO_PIPELINE_ID         || '';
+const KOMMO_STATUS_ID_NOVO      = process.env.KOMMO_STATUS_ID_NOVO      || '';
+const KOMMO_RESPONSIBLE_USER_ID = process.env.KOMMO_RESPONSIBLE_USER_ID || '';
+const BASE_URL                  = process.env.BASE_URL                  || '';
+const WEBHOOK_SECRET            = process.env.WEBHOOK_SECRET            || '';
+const KOMMO_IA_FIELD_ID         = process.env.KOMMO_IA_FIELD_ID         || '3884693'; // campo IA_RESPOSTA no lead
+const KOMMO_MODELOS_FIELD_ID    = process.env.KOMMO_MODELOS_FIELD_ID    || '3884787'; // campo MODELOS_MOSTRAR (códigos dos modelos p/ o bot enviar as fotos)
+const KOMMO_BOT_ID              = process.env.KOMMO_BOT_ID              || '199211';  // bot que envia o campo (IA IMPERIAL BONÉS)
+// Lista de contatos permitidos (fase de teste). Vazio = responde a todos.
+const IA_ALLOWED_CONTACTS       = (process.env.IA_ALLOWED_CONTACTS || '').split(',').map(s => s.trim()).filter(Boolean);
+// Canais (source_id do talk) permitidos na fase de teste. Vazio = todos os canais.
+const IA_ALLOWED_SOURCE_IDS     = (process.env.IA_ALLOWED_SOURCE_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+const PORT                      = process.env.PORT                      || 3000;
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -485,57 +494,202 @@ function salvarDatabase() {
 }
 
 // =============================================================
-//  CHATCLEAN — ENVIO VIA PUSH API
-//  Um único endpoint autenticado (CC_PUSH_URL) entrega texto e mídia.
-//  O token JWT já vem embutido na URL como ?token=... (sem header).
+//  KOMMO API — FUNÇÕES DE ENVIO E CRM
 // =============================================================
-async function ccPush(number, payloadExtra = {}) {
-    if (!CC_PUSH_URL) { console.warn('⚠️ CC_PUSH_URL não configurado no .env — envio ignorado'); return false; }
+function kommoHeaders() {
+    return {
+        'Authorization': `Bearer ${KOMMO_TOKEN}`,
+        'Content-Type':  'application/json'
+    };
+}
+
+async function kommoSendText(talkId, text) {
+    if (!KOMMO_SUBDOMAIN || !KOMMO_TOKEN) { console.warn('⚠️ KOMMO_SUBDOMAIN ou KOMMO_TOKEN não configurados no .env'); return false; }
     try {
-        await axios.post(CC_PUSH_URL, {
-            number: normalizarPhone(number),
-            externalKey: crypto.randomUUID(),
-            ...payloadExtra
-        }, { headers: { 'Content-Type': 'application/json' }, timeout: 30000 });
+        const url = `https://${KOMMO_SUBDOMAIN}.kommo.com/api/v4/talks/${talkId}/messages`;
+        await axios.post(url, { text }, { headers: kommoHeaders(), timeout: 15000 });
         return true;
     } catch (e) {
-        console.error('❌ Erro no Push ChatClean:', e.response?.data || e.message);
+        console.error('❌ Erro ao enviar texto via Kommo:', e.response?.data || e.message);
         return false;
     }
 }
 
-// Notifica a equipe (e registra o resumo) quando um lead é qualificado.
-// Substitui o antigo criarLeadKommo — na ChatClean o "lead" já é o próprio
-// contato/ticket na plataforma; aqui só entregamos o resumo estruturado.
-async function notificarEquipe(leadData, chatId, opcoes = {}) {
-    const nomeProduto = leadData.modeloEscolhido
-        ? (CATALOGO_MODELOS[leadData.modeloEscolhido]?.nome || leadData.modeloEscolhido)
-        : 'A definir';
+async function kommoSendImage(talkId, filePath, caption = '') {
+    if (!KOMMO_SUBDOMAIN || !KOMMO_TOKEN) { console.warn('⚠️ KOMMO_SUBDOMAIN ou KOMMO_TOKEN não configurados no .env'); return false; }
+    try {
+        const absPath = path.isAbsolute(filePath) ? filePath : path.join(__dirname, filePath);
+        if (!fs.existsSync(absPath)) { console.log(`⚠️ Imagem não encontrada: ${absPath}`); return false; }
 
-    const resumo =
-        `🎯 LEAD QUALIFICADO — IA Imperial Bonés${opcoes.tagExtra ? ' [' + opcoes.tagExtra + ']' : ''}\n\n` +
-        `Cliente: ${leadData.nome || 'Lead'} (${chatId})\n` +
-        `Quantidade: ${leadData.quantidade || 'A definir'}\n` +
-        `Finalidade: ${leadData.usoEvento || 'Não informado'}\n` +
-        `Prazo: ${leadData.prazoRecebimento || 'Sem prazo específico'}\n` +
-        `Produto: ${nomeProduto}\n` +
-        `Arte/Logo: ${leadData.temArte === 'sim' ? 'Cliente tem' : leadData.temArte === 'enviou' ? 'Enviou arquivo' : 'Não tem'}\n` +
-        `Técnica: ${leadData.tecnica || 'A definir'}\n` +
-        `Regulador: ${leadData.tipoRegulador || 'Padrão'}\n` +
-        `Cor: ${leadData.corPreferencia || 'A definir'}`;
+        const relativePath = path.relative(__dirname, absPath).replace(/\\/g, '/');
+        const publicUrl = BASE_URL ? `${BASE_URL.replace(/\/$/, '')}/${relativePath}` : null;
+        if (!publicUrl) { console.warn('⚠️ BASE_URL não configurado — envio de imagem ignorado'); return false; }
 
-    // Registra o resumo como nota interna no ticket do próprio cliente (fica no CRM p/ o atendente)
-    await ccPush(chatId, { body: resumo, onlyNote: true, note: { body: resumo } });
+        const url = `https://${KOMMO_SUBDOMAIN}.kommo.com/api/v4/talks/${talkId}/messages`;
+        await axios.post(url, {
+            text: caption,
+            attachments: [{ type: 'image', url: publicUrl }]
+        }, { headers: kommoHeaders(), timeout: 30000 });
+        return true;
+    } catch (e) {
+        console.error('❌ Erro ao enviar imagem via Kommo:', e.response?.data || e.message);
+        return false;
+    }
+}
 
-    // Se houver número da equipe, envia o resumo também por WhatsApp interno
-    if (EQUIPE_NUMERO) await ccPush(EQUIPE_NUMERO, { body: resumo });
+async function criarLeadKommo(leadData, contactId, opcoes = {}) {
+    if (!KOMMO_SUBDOMAIN || !KOMMO_TOKEN) { console.warn('⚠️ KOMMO não configurado — lead não criado'); return null; }
+    try {
+        const baseUrl = `https://${KOMMO_SUBDOMAIN}.kommo.com/api/v4`;
+        const headers = kommoHeaders();
 
-    console.log(`✅ Equipe notificada — lead ${leadData.nome || ''} (${chatId})`);
-    return true;
+        const nomeProduto = leadData.modeloEscolhido
+            ? (CATALOGO_MODELOS[leadData.modeloEscolhido]?.nome || leadData.modeloEscolhido)
+            : 'A definir';
+
+        const tags = [{ name: 'IA-Qualificado' }, { name: 'WhatsApp' }];
+        if (opcoes.tagExtra) tags.push({ name: opcoes.tagExtra });
+
+        const body = [{
+            name: `${leadData.nome || 'Lead'} — ${nomeProduto} ${leadData.quantidade || '?'}un`,
+            price: 0,
+            _embedded: { tags }
+        }];
+        if (KOMMO_PIPELINE_ID)         body[0].pipeline_id         = Number(KOMMO_PIPELINE_ID);
+        if (KOMMO_STATUS_ID_NOVO)      body[0].status_id            = Number(KOMMO_STATUS_ID_NOVO);
+        if (KOMMO_RESPONSIBLE_USER_ID) body[0].responsible_user_id  = Number(KOMMO_RESPONSIBLE_USER_ID);
+        if (contactId)                 body[0]._embedded.contacts   = [{ id: Number(contactId) }];
+
+        const leadRes = await axios.post(`${baseUrl}/leads`, body, { headers, timeout: 15000 });
+        const leadId = leadRes.data._embedded?.leads?.[0]?.id;
+        if (!leadId) return null;
+
+        const nota =
+            `Lead qualificado pela IA Imperial Bonés.\n\n` +
+            `Quantidade: ${leadData.quantidade || 'A definir'}\n` +
+            `Finalidade: ${leadData.usoEvento || 'Não informado'}\n` +
+            `Prazo: ${leadData.prazoRecebimento || 'Sem prazo específico'}\n` +
+            `Produto: ${nomeProduto}\n` +
+            `Arte/Logo: ${leadData.temArte === 'sim' ? 'Cliente tem' : leadData.temArte === 'enviou' ? 'Enviou arquivo' : 'Não tem'}\n` +
+            `Técnica: ${leadData.tecnica || 'A definir'}\n` +
+            `Regulador: ${leadData.tipoRegulador || 'Padrão'}\n` +
+            `Cor: ${leadData.corPreferencia || 'A definir'}`;
+
+        await axios.post(`${baseUrl}/leads/${leadId}/notes`, [{ note_type: 'common', params: { text: nota } }], { headers, timeout: 10000 });
+        console.log(`✅ Lead criado no Kommo: #${leadId} — ${body[0].name}`);
+        return leadId;
+    } catch (e) {
+        console.error('❌ Erro ao criar lead no Kommo:', e.response?.data || e.message);
+        return null;
+    }
+}
+
+// Buscar o lead mais recente vinculado a um contato
+async function buscarLeadIdPorContato(contactId) {
+    try {
+        const url = `https://${KOMMO_SUBDOMAIN}.kommo.com/api/v4/contacts/${contactId}?with=leads`;
+        const r = await axios.get(url, { headers: kommoHeaders(), timeout: 10000 });
+        const leads = r.data?._embedded?.leads || [];
+        if (!leads.length) return null;
+        return leads.map(l => l.id).sort((a, b) => b - a)[0]; // maior id = mais recente
+    } catch (e) {
+        console.error('❌ Erro ao buscar lead do contato:', e.response?.data || e.message);
+        return null;
+    }
+}
+
+// Descobrir o canal (source_id) de um talk — usado no filtro de canal de teste
+async function kommoGetTalkSource(talkId) {
+    if (!talkId) return null;
+    try {
+        const url = `https://${KOMMO_SUBDOMAIN}.kommo.com/api/v4/talks/${talkId}`;
+        const r = await axios.get(url, { headers: kommoHeaders(), timeout: 8000 });
+        return r.data?.source_id != null ? String(r.data.source_id) : null;
+    } catch (e) {
+        console.error('❌ Erro ao buscar source do talk:', e.response?.data || e.message);
+        return null;
+    }
+}
+
+// Lançar o bot (que envia o campo IA_RESPOSTA) no lead, via API
+async function kommoLaunchBot(leadId) {
+    if (!KOMMO_BOT_ID) return false;
+    try {
+        const url = `https://${KOMMO_SUBDOMAIN}.kommo.com/api/v4/bots/${KOMMO_BOT_ID}/run`;
+        await axios.post(url, { entity_id: Number(leadId), entity_type: 'leads' }, { headers: kommoHeaders(), timeout: 10000 });
+        return true;
+    } catch (e) {
+        console.error('❌ Erro ao lançar bot no lead:', e.response?.data || e.message);
+        return false;
+    }
+}
+
+// Gravar os códigos dos modelos que o bot deve enviar como foto (ou limpar).
+// Formato: "IB_SNAP,IB_DAD" — o bot usa condição "MODELOS_MOSTRAR contém IB_SNAP".
+async function kommoSetModelosMostrar(leadId, codigos) {
+    try {
+        const value = (codigos && codigos.length) ? codigos.join(',') : '';
+        const url = `https://${KOMMO_SUBDOMAIN}.kommo.com/api/v4/leads/${leadId}`;
+        await axios.patch(url, {
+            custom_fields_values: [
+                { field_id: Number(KOMMO_MODELOS_FIELD_ID), values: [{ value }] }
+            ]
+        }, { headers: kommoHeaders(), timeout: 15000 });
+        return true;
+    } catch (e) {
+        console.error('❌ Erro ao gravar MODELOS_MOSTRAR:', e.response?.data || e.message);
+        return false;
+    }
+}
+
+// Gravar a resposta da IA no campo IA_RESPOSTA do lead (o Salesbot envia esse campo)
+async function kommoSetIaResposta(leadId, texto) {
+    try {
+        const url = `https://${KOMMO_SUBDOMAIN}.kommo.com/api/v4/leads/${leadId}`;
+        await axios.patch(url, {
+            custom_fields_values: [
+                { field_id: Number(KOMMO_IA_FIELD_ID), values: [{ value: texto }] }
+            ]
+        }, { headers: kommoHeaders(), timeout: 15000 });
+        return true;
+    } catch (e) {
+        console.error('❌ Erro ao gravar IA_RESPOSTA:', e.response?.data || e.message);
+        return false;
+    }
+}
+
+// Grava no campo do lead o texto acumulado no fieldMode
+async function flushIaResposta(chatId) {
+    const leadData = leadsData.get(chatId);
+    if (!leadData?.fieldMode) return;
+    const buffer = leadData.fieldBuffer || [];
+    leadData.fieldMode   = false;
+    leadData.fieldBuffer = [];
+    if (!buffer.length) { console.warn(`⚠️ IA sem resposta para gravar (${chatId})`); return; }
+    const texto = buffer.join('\n');
+    let leadId = leadData.leadId || await buscarLeadIdPorContato(chatId);
+    if (!leadId) { console.warn(`⚠️ Lead não encontrado para contato ${chatId} — resposta não gravada`); return; }
+    leadData.leadId = leadId;
+    const ok = await kommoSetIaResposta(leadId, texto);
+    if (!ok) return;
+    console.log(`✅ IA_RESPOSTA gravada no lead #${leadId} (${texto.length} chars)`);
+
+    // Modelos a mostrar como foto (sempre grava: códigos ou vazio p/ não repetir do turno anterior)
+    const modelos = leadData.modelosMostrar || [];
+    leadData.modelosMostrar = [];
+    await kommoSetModelosMostrar(leadId, modelos);
+    if (modelos.length) console.log(`🖼️ MODELOS_MOSTRAR = ${modelos.join(',')}`);
+
+    // Campos já gravados → lança o bot que entrega texto + fotos ao cliente
+    const launched = await kommoLaunchBot(leadId);
+    if (launched) console.log(`🤖 Bot ${KOMMO_BOT_ID} lançado no lead #${leadId}`);
 }
 
 // =============================================================
-//  FUNÇÕES DE ENVIO  (tudo via ChatClean Push)
+//  FUNÇÕES DE ENVIO
+//  Modo direto  → kommoSendText via Chat API (talkId)
+//  Modo Salesbot → coleta em salesbotHandlers para return_url
+//  Modo Campo    → acumula em fieldBuffer p/ gravar no campo IA_RESPOSTA
 // =============================================================
 function buildPublicUrl(filePath) {
     if (!BASE_URL) return null;
@@ -545,8 +699,21 @@ function buildPublicUrl(filePath) {
 }
 
 async function enviarMensagem(chatId, texto) {
-    if (!texto || !String(texto).trim()) return false;
-    return ccPush(chatId, { body: texto });
+    const leadData = leadsData.get(chatId);
+    if (leadData?.fieldMode) {
+        (leadData.fieldBuffer = leadData.fieldBuffer || []).push(texto);
+        return true;
+    }
+    if (leadData?.salesbotMode) {
+        (leadData.salesbotHandlers = leadData.salesbotHandlers || []).push({
+            handler: 'show',
+            params: { type: 'text', value: texto }
+        });
+        return true;
+    }
+    const talkId = leadData?.talkId;
+    if (!talkId) { console.warn(`⚠️ talkId não encontrado para ${chatId} — mensagem não enviada`); return false; }
+    return kommoSendText(talkId, texto);
 }
 
 async function enviarMensagensQuebradas(chatId, textoCompleto) {
@@ -563,14 +730,48 @@ async function enviarMensagensQuebradas(chatId, textoCompleto) {
 
 async function enviarImagens(chatId, arquivos, legenda = '') {
     try {
-        for (const arquivo of arquivos) {
-            const url = buildPublicUrl(arquivo);
-            if (!url) { console.warn('⚠️ BASE_URL não configurado — imagem ignorada'); continue; }
-            const absPath = path.isAbsolute(arquivo) ? arquivo : path.join(__dirname, arquivo);
-            if (!fs.existsSync(absPath)) { console.log(`⚠️ Imagem não encontrada: ${absPath}`); continue; }
+        const leadData = leadsData.get(chatId);
 
+        if (leadData?.fieldMode) {
+            // Modelos do catálogo → registra o código p/ o bot enviar a foto (via MODELOS_MOSTRAR).
+            // A legenda do modelo NÃO vai como texto (a foto no bot já tem a legenda estática).
+            let ehModelo = false;
+            for (const arq of arquivos) {
+                const modelo = Object.values(CATALOGO_MODELOS).find(m => m.arquivo === arq);
+                if (modelo) {
+                    ehModelo = true;
+                    leadData.modelosMostrar = leadData.modelosMostrar || [];
+                    if (!leadData.modelosMostrar.includes(modelo.codigo)) {
+                        leadData.modelosMostrar.push(modelo.codigo);
+                    }
+                }
+            }
+            // Imagens que não são modelos (régua/técnica) → manda a legenda como texto
+            if (legenda && !ehModelo) (leadData.fieldBuffer = leadData.fieldBuffer || []).push(legenda);
+            return true;
+        }
+
+        if (leadData?.salesbotMode) {
+            leadData.salesbotHandlers = leadData.salesbotHandlers || [];
+            if (legenda) {
+                leadData.salesbotHandlers.push({ handler: 'show', params: { type: 'text', value: legenda } });
+            }
+            for (const arquivo of arquivos) {
+                const url = buildPublicUrl(arquivo);
+                if (url) {
+                    leadData.salesbotHandlers.push({ handler: 'show', params: { type: 'picture', value: url } });
+                }
+            }
+            return true;
+        }
+
+        const talkId = leadData?.talkId;
+        if (!talkId) { console.warn(`⚠️ talkId não encontrado para ${chatId} — imagens não enviadas`); return false; }
+        for (const arquivo of arquivos) {
             console.log(`📤 Enviando imagem para ${chatId}: ${arquivo}`);
-            await ccPush(chatId, { body: legenda || '', mediaUrl: url });
+            await new Promise(resolve => setTimeout(resolve, 1500));
+            const ok = await kommoSendImage(talkId, arquivo, legenda);
+            if (ok) console.log(`✅ Imagem enviada: ${arquivo}`);
             await new Promise(resolve => setTimeout(resolve, 1500));
         }
         return true;
@@ -1188,7 +1389,7 @@ async function processarPedidoImagens(chatId, extraido, leadData, proximoCampoDe
 // =============================================================
 //  PROCESSAMENTO DE MENSAGEM
 // =============================================================
-async function processarMensagem({ chatId, texto, tipo, mediaBase64, mediaMimetype, quotedText, nomeContato }) {
+async function processarMensagem({ chatId, talkId, chatApiId, authorId, texto, tipo, mediaBase64, mediaMimetype, quotedText }) {
     if (processandoMensagem.get(chatId)) {
         console.log(`⚠️ Já processando mensagem de ${chatId}. Ignorando.`);
         return;
@@ -1207,8 +1408,10 @@ async function processarMensagem({ chatId, texto, tipo, mediaBase64, mediaMimety
             leadsData.set(chatId, { conversationHistory: [] });
         }
         const leadData = leadsData.get(chatId);
-        // Captura o nome do contato vindo do ChatClean (se ainda não temos)
-        if (nomeContato && !leadData.nome) leadData.nome = nomeContato;
+        // Atualizar IDs de chat a cada mensagem
+        if (talkId)    leadData.talkId    = talkId;
+        if (chatApiId) leadData.chatApiId = chatApiId; // conversation_id para Chat API
+        if (authorId)  leadData.authorId  = authorId;  // ID do cliente no canal
 
         if (timersFollowUp.has(chatId)) {
             clearTimeout(timersFollowUp.get(chatId));
@@ -1476,9 +1679,7 @@ async function processarMensagem({ chatId, texto, tipo, mediaBase64, mediaMimety
         // Transbordo para pedidos grandes (ajustar limite conforme política da Imperial)
         if (leadData.quantidade > 100) {
             await enviarMensagem(chatId, 'Para pedidos acima de 100 unidades, vou te passar para um de nossos consultores para uma negociação especial! 🤝');
-            await enviarMensagem(chatId, 'Transferir para o departamento Comercial');
-            leadData.finalizado = true;
-            await notificarEquipe(leadData, chatId, { tagExtra: 'Transbordo+100' });
+            await criarLeadKommo(leadData, chatId, { tagExtra: 'Transbordo+100' });
             return;
         }
 
@@ -1527,8 +1728,7 @@ async function processarMensagem({ chatId, texto, tipo, mediaBase64, mediaMimety
             databaseLeads.leads.push({ ...leadData, chatId, data: obterDataHoraBrasilia() });
             salvarDatabase();
 
-            await enviarMensagem(chatId, 'Transferir para o departamento Comercial');
-            await notificarEquipe(leadData, chatId);
+            await criarLeadKommo(leadData, chatId);
         } else if (!leadData.finalizado) {
             agendarFollowUpReativacao(chatId, leadData);
         }
@@ -1541,66 +1741,125 @@ async function processarMensagem({ chatId, texto, tipo, mediaBase64, mediaMimety
     }
 }
 
-// (Endpoint /salesbot removido — era específico do Kommo. Na ChatClean a saída
-//  é feita diretamente via Push API, sem return_url nem handlers.)
+// =============================================================
+//  SALESBOT ENDPOINT
+//  Recebe POST do widget_request do Salesbot Kommo,
+//  processa com IA e responde via return_url.
+// =============================================================
+async function flushSalesbotResponse(leadData) {
+    if (!leadData?.salesbotReturnUrl) return;
+    const handlers = leadData.salesbotHandlers || [];
+    const returnUrl = leadData.salesbotReturnUrl;
+
+    // Limpar para próxima mensagem
+    leadData.salesbotHandlers  = [];
+    leadData.salesbotReturnUrl = null;
+    leadData.salesbotMode      = false;
+
+    if (!handlers.length) {
+        console.warn('⚠️ Salesbot: nenhum handler coletado — return_url não chamado');
+        return;
+    }
+
+    try {
+        await axios.post(returnUrl, { execute_handlers: handlers }, {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 10000
+        });
+        console.log(`✅ Salesbot: ${handlers.length} handler(s) enviado(s) para return_url`);
+    } catch (e) {
+        console.error('❌ Erro ao chamar return_url do Salesbot:', e.response?.data || e.message);
+    }
+}
+
+app.post('/salesbot', express.json(), async (req, res) => {
+    res.status(200).json({ status: 'ok' });
+
+    const { token, data, return_url } = req.body || {};
+    if (!return_url || !data) return;
+
+    const contactId  = String(data.contact_id || data.lead_id || '');
+    const texto      = String(data.message    || '').trim();
+    const nomeContato = String(data.contact_name || '');
+
+    if (!contactId || !texto) {
+        console.warn('⚠️ Salesbot: contact_id ou message ausente no payload');
+        return;
+    }
+
+    console.log(`📩 Salesbot recebido de ${contactId}: "${texto}"`);
+
+    // Preparar o lead para modo Salesbot
+    if (!leadsData.has(contactId)) {
+        leadsData.set(contactId, { conversationHistory: [] });
+    }
+    const leadData = leadsData.get(contactId);
+    leadData.salesbotMode      = true;
+    leadData.salesbotReturnUrl = return_url;
+    leadData.salesbotHandlers  = [];
+
+    setImmediate(async () => {
+        try {
+            await processarMensagem({
+                chatId:       contactId,
+                talkId:       null,
+                chatApiId:    null,
+                authorId:     null,
+                texto,
+                tipo:         'text',
+                mediaBase64:  null,
+                mediaMimetype: null,
+                quotedText:   null,
+                nomeContato
+            });
+        } catch (e) {
+            console.error('❌ Erro ao processar mensagem Salesbot:', e);
+        } finally {
+            await flushSalesbotResponse(leadsData.get(contactId));
+        }
+    });
+});
 
 // =============================================================
 //  WEBHOOK
 // =============================================================
 function parsePayload(body) {
     try {
-        // Normaliza o tipo de mensagem para os valores que o fluxo entende
-        const normTipo = (t) => {
-            const v = String(t || 'text').toLowerCase();
-            if (['image', 'audio', 'ptt', 'document', 'text'].includes(v)) return v;
-            if (v === 'chat' || v === '') return 'text';
-            return v; // sticker/video/location etc. → tratado como não-texto no /webhook
-        };
-
-        // --- Formato ChatClean (documentado): contact + message aninhados ---
-        //   { contact:{number,name}, message:{body,type,fromMe,id,quotedMsg:{body},mediaUrl} }
-        if (body?.contact || (body?.message && typeof body.message === 'object' && !body.message.add)) {
-            const contato = body.contact || {};
-            const msg     = body.message || {};
-            if (msg.fromMe) return null; // ignora mensagens enviadas pelo atendente/bot
-            const numero = contato.number || contato.phone || body.number;
-            const phone  = normalizarPhone(numero);
-            if (!phone) return null;
+        // Formato Kommo (application/x-www-form-urlencoded com extended=true)
+        if (body?.message?.add) {
+            const msgs = body.message.add;
+            const arr = Array.isArray(msgs) ? msgs : [msgs];
+            const msg = arr[0];
+            if (!msg) return null;
+            // Ignorar mensagens do atendente humano — type "incoming" = cliente, "outgoing" = atendente
+            if (msg.type && msg.type !== 'incoming') return null;
+            const contactId = msg.contact_id ? String(msg.contact_id) : null;
+            if (!contactId) return null;
+            // O payload já traz o lead: entity_type "lead" + entity_id/element_id
+            const leadId = (msg.entity_type === 'lead' && msg.entity_id)
+                ? String(msg.entity_id)
+                : (msg.element_id ? String(msg.element_id) : null);
             return {
-                chatId:        phone,
-                msgId:         msg.id ? String(msg.id) : null,
-                texto:         String(msg.body || msg.text || '').trim(),
-                tipo:          normTipo(msg.type),
-                mediaBase64:   msg.mediaBase64 || msg.base64 || null,
-                mediaMimetype: msg.mimetype || null,
-                quotedText:    msg.quotedMsg?.body || msg.quotedMsg?.text || null,
-                nomeContato:   contato.name || body.contactName || ''
+                chatId:       contactId,
+                msgId:        msg.id ? String(msg.id) : null, // id único da mensagem (dedup)
+                talkId:       msg.talk_id,
+                chatApiId:    msg.chat_id,     // conversation_id para Chat API
+                authorId:     msg.author?.id,  // receiver.id ao enviar resposta
+                leadId,                        // lead ao qual a mensagem pertence
+                texto:        (msg.text || '').trim(),
+                tipo:         'text',
+                mediaBase64:  null,
+                mediaMimetype: null,
+                quotedText:   null,
+                nomeContato:  msg.author?.name || ''
             };
         }
 
-        // --- Formato plano (webhook/n8n simples) ---
-        //   { number, type, body, contactName, id }
-        if (body?.number && (body?.body !== undefined || body?.type)) {
-            if (body.fromMe) return null;
-            const phone = normalizarPhone(body.number);
-            if (!phone) return null;
-            return {
-                chatId:        phone,
-                msgId:         body.id ? String(body.id) : null,
-                texto:         String(body.body || '').trim(),
-                tipo:          normTipo(body.type),
-                mediaBase64:   body.mediaBase64 || body.base64 || null,
-                mediaMimetype: body.mimetype || null,
-                quotedText:    body.quotedText || null,
-                nomeContato:   body.contactName || body.name || ''
-            };
-        }
-
-        // --- Formato alternativo simples (testes locais) ---
+        // Formato alternativo simples (testes locais)
         if (body?.numero_cliente && body?.mensagem_cliente !== undefined) {
             const phone = normalizarPhone(body.numero_cliente);
             if (!phone) return null;
-            return { chatId: phone, msgId: null, texto: String(body.mensagem_cliente || '').trim(), tipo: 'text', mediaBase64: null, mediaMimetype: null, quotedText: null, nomeContato: '' };
+            return { chatId: phone, talkId: body.talk_id || null, texto: String(body.mensagem_cliente || '').trim(), tipo: 'text', mediaBase64: null, mediaMimetype: null, quotedText: null };
         }
 
         console.log('⚠️ Payload não reconhecido:', JSON.stringify(body, null, 2).slice(0, 800));
@@ -1611,14 +1870,15 @@ function parsePayload(body) {
     }
 }
 
-// IDs de mensagens já processadas (evita webhooks duplicados)
+// IDs de mensagens já processadas (evita webhooks duplicados do Kommo)
 const mensagensProcessadas = new Set();
 
-// Tipos de mídia que o fluxo trata internamente (áudio → transcreve; imagem/doc → arte)
-const TIPOS_SUPORTADOS = ['text', 'image', 'document', 'audio', 'ptt'];
-
-app.post('/webhook', express.json({ limit: '10mb' }), async (req, res) => {
-    // Responder imediatamente (o ChatClean espera resposta rápida)
+// O Kommo envia application/x-www-form-urlencoded; aceitar ambos os formatos
+app.post('/webhook',
+    express.urlencoded({ extended: true }),
+    express.json({ limit: '10mb' }),
+    async (req, res) => {
+    // Responder imediatamente (Kommo exige resposta em < 2 segundos)
     res.status(200).json({ status: 'ok' });
 
     try {
@@ -1638,15 +1898,15 @@ app.post('/webhook', express.json({ limit: '10mb' }), async (req, res) => {
         const parsed = parsePayload(req.body);
         if (!parsed) return;
 
-        console.log(`📩 Webhook de ${parsed.chatId} [${parsed.tipo}]: "${parsed.texto || '[mídia]'}"`);
+        console.log(`📩 Webhook recebido de ${parsed.chatId} (talk:${parsed.talkId}): "${parsed.texto || '[mídia]'}"`);
 
-        // Fase de teste: só responde aos números da lista permitida
+        // Fase de teste: só responde aos contatos da lista permitida
         if (IA_ALLOWED_CONTACTS.length && !IA_ALLOWED_CONTACTS.includes(parsed.chatId)) {
             console.log(`🚫 Contato ${parsed.chatId} fora da lista de teste — ignorado`);
             return;
         }
 
-        // Dedup: o ChatClean pode reenviar o mesmo webhook
+        // Dedup: o Kommo às vezes reenvia o mesmo webhook
         if (parsed.msgId) {
             if (mensagensProcessadas.has(parsed.msgId)) {
                 console.log(`↩️ Mensagem duplicada (${parsed.msgId}) ignorada`);
@@ -1658,19 +1918,41 @@ app.post('/webhook', express.json({ limit: '10mb' }), async (req, res) => {
             }
         }
 
-        // Mídia não suportada (vídeo, sticker, localização...) → fallback humanizado
-        if (!TIPOS_SUPORTADOS.includes(parsed.tipo)) {
-            await enviarMensagem(parsed.chatId, 'Pode me mandar por texto o que você precisa? Assim consigo te ajudar melhor 🙂');
-            return;
+        // Fase de teste: só responde no canal permitido (source_id do talk)
+        if (IA_ALLOWED_SOURCE_IDS.length) {
+            const sourceId = await kommoGetTalkSource(parsed.talkId);
+            if (!sourceId || !IA_ALLOWED_SOURCE_IDS.includes(sourceId)) {
+                console.log(`🚫 Canal source_id=${sourceId} fora da lista de teste — ignorado`);
+                return;
+            }
+            console.log(`✅ Canal source_id=${sourceId} permitido`);
         }
 
-        // Guarda de concorrência: evita dois processamentos simultâneos do mesmo contato
+        // Guarda de concorrência: evita que dois processamentos do mesmo contato
+        // corrompam o fieldBuffer compartilhado (causa do valor sobrescrito)
         if (processandoMensagem.get(parsed.chatId)) {
             console.log(`⏳ Já processando ${parsed.chatId} — ignorando concorrente`);
             return;
         }
 
-        setImmediate(() => processarMensagem(parsed));
+        // Modo Campo: IA processa e grava a resposta no campo IA_RESPOSTA do lead;
+        // depois o servidor lança o bot que entrega o campo ao cliente.
+        if (!leadsData.has(parsed.chatId)) leadsData.set(parsed.chatId, { conversationHistory: [] });
+        const ld = leadsData.get(parsed.chatId);
+        ld.fieldMode   = true;
+        ld.fieldBuffer = [];
+        if (parsed.talkId) ld.talkId = parsed.talkId;
+        if (parsed.leadId) ld.leadId = parsed.leadId; // grava no lead exato do payload
+
+        setImmediate(async () => {
+            try {
+                await processarMensagem(parsed);
+            } catch (e) {
+                console.error('❌ Erro ao processar (fieldMode):', e);
+            } finally {
+                await flushIaResposta(parsed.chatId);
+            }
+        });
 
     } catch (e) {
         console.error('❌ Erro no handler do webhook:', e);
@@ -1691,16 +1973,16 @@ app.get('/webhook', (req, res) => {
 app.listen(PORT, () => {
     console.log('');
     console.log('🚀 ================================');
-    console.log(`🤖 IA Imperial Bonés — CHATCLEAN MODE`);
+    console.log(`🤖 IA Imperial Bonés — KOMMO MODE`);
     console.log(`📡 Servidor rodando na porta ${PORT}`);
     console.log(`🔗 Webhook URL: https://SEU_DOMINIO/webhook`);
     console.log(`❤️  Health:     https://SEU_DOMINIO/health`);
     console.log('🚀 ================================');
     console.log('');
 
-    if (!CC_PUSH_URL)   console.warn('⚠️  ATENÇÃO: CC_PUSH_URL não configurado — a IA não conseguirá responder.');
-    if (!BASE_URL)      console.warn('⚠️  ATENÇÃO: BASE_URL não configurado — envio de imagens desativado.');
-    if (!EQUIPE_NUMERO) console.warn('ℹ️  EQUIPE_NUMERO não configurado — resumo de lead qualificado só irá como nota interna.');
+    if (!KOMMO_SUBDOMAIN) console.warn('⚠️  ATENÇÃO: KOMMO_SUBDOMAIN não configurado no .env');
+    if (!KOMMO_TOKEN)     console.warn('⚠️  ATENÇÃO: KOMMO_TOKEN não configurado no .env');
+    if (!BASE_URL)        console.warn('⚠️  ATENÇÃO: BASE_URL não configurado — envio de imagens desativado.');
     if (!process.env.OPENAI_API_KEY) { console.error('❌ OPENAI_API_KEY não configurada no .env!'); process.exit(1); }
 
     setInterval(() => { try { salvarDatabase(); } catch (_) {} }, 5 * 60 * 1000);

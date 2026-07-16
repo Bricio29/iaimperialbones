@@ -1,0 +1,13 @@
+node_modules
+.env
+.env.*.bak
+database.json
+*.log
+.DS_Store
+docs/
+*.rar
+*.bak.js
+*.zip
+prints/
+widget/
+.git
