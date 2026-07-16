@@ -1,9 +1,0 @@
-{
-  "settings": {
-    "name": "IA Imperial Bonés",
-    "description": "Integração com a IA de atendimento Imperial Bonés Personalizados. Processa mensagens do WhatsApp com GPT e responde automaticamente pelo Kommo.",
-    "short_description": "IA de atendimento Imperial Bonés",
-    "handler_name": "Chamar IA Imperial Bonés",
-    "webhook_url": "URL do servidor da IA (ex: https://seudominio.com/salesbot)"
-  }
-}

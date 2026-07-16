@@ -1,9 +1,0 @@
-{
-  "settings": {
-    "name": "IA Imperial Bones",
-    "description": "Integración con el chatbot IA de Imperial Bones. Procesa mensajes de WhatsApp con GPT y responde automáticamente a través de Kommo.",
-    "short_description": "Chatbot IA Imperial Bones",
-    "handler_name": "Llamar a la IA Imperial Bones",
-    "webhook_url": "URL del servidor de IA (ej: https://tudominio.com/salesbot)"
-  }
-}
